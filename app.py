@@ -135,6 +135,8 @@ esp32_status = {
     "nama": "",
     "jam": "",
     "waktu_sekarang": "",
+    "waktu_source": "NONE",
+    "rtc_ok": False,
     "ip": "",
     "ram": 0,
     "version": 0,
@@ -575,17 +577,36 @@ def api_jadwal():
 )
 def api_time():
 
-    now = now_local()
+    try:
+        now = now_local()
 
+        # timestamp absolut (UTC epoch)
+        timestamp = int(now.timestamp())
 
-    return jsonify({
-        "tahun": now.year,
-        "bulan": now.month,
-        "tanggal": now.day,
-        "jam": now.hour,
-        "menit": now.minute,
-        "detik": now.second
-    })
+        # Epoch lokal WIB. MicroPython ESP32 akan menggunakannya
+        # bersama time.localtime() sebagai software clock lokal.
+        timestamp_wib = timestamp + (7 * 3600)
+
+        return jsonify({
+            "success": True,
+            "tahun": now.year,
+            "bulan": now.month,
+            "tanggal": now.day,
+            "jam": now.hour,
+            "menit": now.minute,
+            "detik": now.second,
+            "timezone": "Asia/Jakarta",
+            "datetime": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": timestamp,
+            "timestamp_wib": timestamp_wib
+        })
+
+    except Exception as e:
+        print("[TIME ERROR]", e)
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 
 # =========================================================
@@ -613,6 +634,12 @@ def receive_status():
         }), 400
 
 
+    rtc_value = data.get("rtc_ok", False)
+    if isinstance(rtc_value, str):
+        rtc_value = rtc_value.lower() in (
+            "true", "1", "yes", "on"
+        )
+
     esp32_status = {
 
         "status": data.get(
@@ -634,6 +661,13 @@ def receive_status():
             "waktu_sekarang",
             ""
         ),
+
+        "waktu_source": data.get(
+            "waktu_source",
+            "NONE"
+        ),
+
+        "rtc_ok": bool(rtc_value),
 
         "ip": data.get(
             "ip",
@@ -665,6 +699,42 @@ def receive_status():
 
     return jsonify({
         "status": "ok"
+    })
+
+
+# =========================================================
+# API STATUS ESP32 - GET
+# =========================================================
+
+@app.route(
+    "/api/esp32/status",
+    methods=["GET"]
+)
+def get_esp32_status():
+
+    result = dict(esp32_status)
+
+    online = False
+
+    if esp32_status.get("last_update"):
+        try:
+            last = datetime.strptime(
+                esp32_status["last_update"],
+                "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=TIMEZONE)
+
+            online = (
+                now_local() - last
+            ).total_seconds() <= 30
+
+        except Exception:
+            online = False
+
+    result["online"] = online
+
+    return jsonify({
+        "success": True,
+        "status": result
     })
 
 
@@ -795,3 +865,4 @@ if __name__ == "__main__":
         port=5007,
         debug=False
     )
+
