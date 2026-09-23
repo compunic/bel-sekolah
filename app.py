@@ -4,13 +4,16 @@ from flask import (
     request,
     jsonify,
     redirect,
-    url_for
+    url_for,
+    session,
+    flash
 )
 
 import sqlite3
-from datetime import datetime
+import os
+from functools import wraps
 from datetime import datetime, timezone, timedelta
-
+from werkzeug.security import generate_password_hash, check_password_hash
 
 
 # =========================================================
@@ -20,9 +23,19 @@ from datetime import datetime, timezone, timedelta
 app = Flask(__name__)
 
 DATABASE = "bel.db"
+TIMEZONE = timezone(timedelta(hours=7))
 
-TIMEZONE = timezone(
-    timedelta(hours=7)
+# Ganti FLASK_SECRET_KEY pada environment server untuk produksi.
+app.secret_key = os.environ.get(
+    "FLASK_SECRET_KEY",
+    "ganti-secret-key-bel-sekolah-2026"
+)
+
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("FLASK_HTTPS", "0") == "1",
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
 )
 
 
@@ -31,18 +44,12 @@ TIMEZONE = timezone(
 # =========================================================
 
 def get_db():
-
-    conn = sqlite3.connect(
-        DATABASE
-    )
-
+    conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
-
     return conn
 
 
 def init_db():
-
     conn = get_db()
 
     conn.execute("""
@@ -57,7 +64,6 @@ def init_db():
         )
     """)
 
-
     conn.execute("""
         CREATE TABLE IF NOT EXISTS config (
             id INTEGER PRIMARY KEY CHECK(id=1),
@@ -65,7 +71,6 @@ def init_db():
             volume INTEGER NOT NULL DEFAULT 25
         )
     """)
-
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS test_bell (
@@ -76,54 +81,156 @@ def init_db():
         )
     """)
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'admin',
+            aktif INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        )
+    """)
 
     row = conn.execute(
         "SELECT id FROM config WHERE id=1"
     ).fetchone()
 
-
     if row is None:
-
         conn.execute("""
-            INSERT INTO config
-            (id, version, volume)
+            INSERT INTO config (id, version, volume)
             VALUES (1, 1, 25)
         """)
 
+    # Akun awal hanya dibuat jika tabel users masih kosong.
+    # Login awal: admin / admin123
+    user_count = conn.execute(
+        "SELECT COUNT(*) AS total FROM users"
+    ).fetchone()["total"]
+
+    if user_count == 0:
+        conn.execute("""
+            INSERT INTO users
+            (username, password_hash, role, aktif, created_at)
+            VALUES (?, ?, 'admin', 1, ?)
+        """, (
+            "admin",
+            generate_password_hash("admin123"),
+            now_local().strftime("%Y-%m-%d %H:%M:%S")
+        ))
 
     conn.commit()
-
     conn.close()
 
 
 def get_version():
-
     conn = get_db()
-
     row = conn.execute("""
         SELECT version
         FROM config
         WHERE id=1
     """).fetchone()
-
     conn.close()
-
-    return row["version"]
+    return row["version"] if row else 1
 
 
 def bump_version():
-
     conn = get_db()
-
     conn.execute("""
         UPDATE config
         SET version = version + 1
         WHERE id=1
     """)
-
     conn.commit()
-
     conn.close()
+
+
+# =========================================================
+# AUTHENTICATION
+# =========================================================
+
+def login_required(view):
+    @wraps(view)
+    def wrapped_view(*args, **kwargs):
+        if "username" not in session:
+            if request.path.startswith("/api/"):
+                return jsonify({
+                    "success": False,
+                    "error": "authentication_required"
+                }), 401
+
+            return redirect(url_for(
+                "login",
+                next=request.path
+            ))
+
+        # Pastikan akun masih aktif.
+        conn = get_db()
+        user = conn.execute("""
+            SELECT username, role, aktif
+            FROM users
+            WHERE username=?
+            LIMIT 1
+        """, (session["username"],)).fetchone()
+        conn.close()
+
+        if user is None or not user["aktif"]:
+            session.clear()
+            if request.path.startswith("/api/"):
+                return jsonify({
+                    "success": False,
+                    "error": "account_inactive"
+                }), 401
+            return redirect(url_for("login"))
+
+        return view(*args, **kwargs)
+
+    return wrapped_view
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if "username" in session:
+        return redirect(url_for("index"))
+
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        conn = get_db()
+        user = conn.execute("""
+            SELECT username, password_hash, role, aktif
+            FROM users
+            WHERE username=?
+            LIMIT 1
+        """, (username,)).fetchone()
+        conn.close()
+
+        if (
+            user
+            and user["aktif"]
+            and check_password_hash(user["password_hash"], password)
+        ):
+            session.clear()
+            session["username"] = user["username"]
+            session["role"] = user["role"]
+            session.permanent = True
+
+            next_url = request.args.get("next", "")
+            if next_url.startswith("/") and not next_url.startswith("//"):
+                return redirect(next_url)
+
+            return redirect(url_for("index"))
+
+        flash("Username atau password salah.", "error")
+
+    return render_template("login.html")
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 
 # =========================================================
@@ -160,10 +267,22 @@ HARI = {
 
 
 def now_local():
+    return datetime.now(TIMEZONE)
 
-    return datetime.now(
-        TIMEZONE
-    )
+
+def is_esp32_online():
+    if not esp32_status.get("last_update"):
+        return False
+
+    try:
+        last = datetime.strptime(
+            esp32_status["last_update"],
+            "%Y-%m-%d %H:%M:%S"
+        ).replace(tzinfo=TIMEZONE)
+
+        return (now_local() - last).total_seconds() <= 30
+    except Exception:
+        return False
 
 
 # =========================================================
@@ -171,8 +290,8 @@ def now_local():
 # =========================================================
 
 @app.route("/")
+@login_required
 def index():
-
     conn = get_db()
 
     jadwal = conn.execute("""
@@ -181,23 +300,21 @@ def index():
         ORDER BY hari, jam
     """).fetchall()
 
-
     config = conn.execute("""
         SELECT *
         FROM config
         WHERE id=1
     """).fetchone()
 
-
     conn.close()
-
 
     return render_template(
         "index.html",
         jadwal=jadwal,
         status=esp32_status,
         config=config,
-        hari=HARI
+        hari=HARI,
+        username=session.get("username", "")
     )
 
 
@@ -205,299 +322,177 @@ def index():
 # TAMBAH JADWAL
 # =========================================================
 
-@app.route(
-    "/jadwal/tambah",
-    methods=["POST"]
-)
+@app.route("/jadwal/tambah", methods=["POST"])
+@login_required
 def tambah_jadwal():
+    try:
+        hari = int(request.form["hari"])
+        jam = request.form["jam"].strip()
+        nama = request.form["nama"].strip()
+        file_mp3 = int(request.form["file_mp3"])
+        durasi = int(request.form["durasi"])
+        aktif = int(request.form.get("aktif", "1"))
 
-    hari = int(
-        request.form["hari"]
-    )
+        if hari not in HARI or not nama:
+            flash("Data jadwal tidak valid.", "error")
+            return redirect(url_for("index"))
 
-    jam = request.form["jam"]
+        datetime.strptime(jam, "%H:%M")
 
-    nama = request.form[
-        "nama"
-    ].strip()
+        if file_mp3 < 1 or durasi < 1:
+            raise ValueError
 
-    file_mp3 = int(
-        request.form["file_mp3"]
-    )
-
-    durasi = int(
-        request.form["durasi"]
-    )
-
-    aktif = int(
-        request.form.get(
-            "aktif",
-            "1"
-        )
-    )
-
-
-    if not nama:
-
-        return redirect(
-            url_for("index")
-        )
-
+    except (ValueError, KeyError):
+        flash("Data jadwal tidak valid.", "error")
+        return redirect(url_for("index"))
 
     conn = get_db()
-
     conn.execute("""
         INSERT INTO jadwal
-        (
-            hari,
-            jam,
-            nama,
-            file_mp3,
-            durasi,
-            aktif
-        )
+        (hari, jam, nama, file_mp3, durasi, aktif)
         VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        hari,
-        jam,
-        nama,
-        file_mp3,
-        durasi,
-        aktif
-    ))
-
+    """, (hari, jam, nama, file_mp3, durasi, aktif))
     conn.commit()
-
     conn.close()
 
-
     bump_version()
-
-
-    return redirect(
-        url_for("index")
-    )
+    flash("Jadwal berhasil ditambahkan.", "success")
+    return redirect(url_for("index"))
 
 
 # =========================================================
 # UPDATE JADWAL
 # =========================================================
 
-@app.route(
-    "/jadwal/update/<int:id>",
-    methods=["POST"]
-)
+@app.route("/jadwal/update/<int:id>", methods=["POST"])
+@login_required
 def update_jadwal(id):
+    try:
+        hari = int(request.form["hari"])
+        jam = request.form["jam"].strip()
+        nama = request.form["nama"].strip()
+        file_mp3 = int(request.form["file_mp3"])
+        durasi = int(request.form["durasi"])
+        aktif = int(request.form.get("aktif", "0"))
 
-    hari = int(
-        request.form["hari"]
-    )
+        if hari not in HARI or not nama:
+            raise ValueError
 
-    jam = request.form["jam"]
+        datetime.strptime(jam, "%H:%M")
 
-    nama = request.form[
-        "nama"
-    ].strip()
+        if file_mp3 < 1 or durasi < 1:
+            raise ValueError
 
-    file_mp3 = int(
-        request.form["file_mp3"]
-    )
-
-    durasi = int(
-        request.form["durasi"]
-    )
-
-    aktif = int(
-        request.form.get(
-            "aktif",
-            "0"
-        )
-    )
-
+    except (ValueError, KeyError):
+        flash("Data jadwal tidak valid.", "error")
+        return redirect(url_for("index"))
 
     conn = get_db()
-
     conn.execute("""
         UPDATE jadwal
-        SET
-            hari=?,
-            jam=?,
-            nama=?,
-            file_mp3=?,
-            durasi=?,
-            aktif=?
+        SET hari=?, jam=?, nama=?, file_mp3=?, durasi=?, aktif=?
         WHERE id=?
-    """, (
-        hari,
-        jam,
-        nama,
-        file_mp3,
-        durasi,
-        aktif,
-        id
-    ))
-
+    """, (hari, jam, nama, file_mp3, durasi, aktif, id))
     conn.commit()
-
     conn.close()
 
-
     bump_version()
-
-
-    return redirect(
-        url_for("index")
-    )
+    flash("Jadwal berhasil diperbarui.", "success")
+    return redirect(url_for("index"))
 
 
 # =========================================================
 # HAPUS JADWAL
 # =========================================================
 
-@app.route(
-    "/jadwal/hapus/<int:id>"
-)
+@app.route("/jadwal/hapus/<int:id>")
+@login_required
 def hapus_jadwal(id):
-
     conn = get_db()
-
-    conn.execute(
-        "DELETE FROM jadwal WHERE id=?",
-        (id,)
-    )
-
+    conn.execute("DELETE FROM jadwal WHERE id=?", (id,))
     conn.commit()
-
     conn.close()
 
-
     bump_version()
-
-
-    return redirect(
-        url_for("index")
-    )
+    flash("Jadwal berhasil dihapus.", "success")
+    return redirect(url_for("index"))
 
 
 # =========================================================
 # VOLUME
 # =========================================================
 
-@app.route(
-    "/config/volume",
-    methods=["POST"]
-)
+@app.route("/config/volume", methods=["POST"])
+@login_required
 def set_volume():
+    try:
+        volume = int(request.form["volume"])
+    except (ValueError, KeyError):
+        flash("Volume tidak valid.", "error")
+        return redirect(url_for("index"))
 
-    volume = int(
-        request.form["volume"]
-    )
-
-
-    if volume < 0:
-        volume = 0
-
-    if volume > 30:
-        volume = 30
-
+    volume = max(0, min(30, volume))
 
     conn = get_db()
-
     conn.execute("""
         UPDATE config
         SET volume=?
         WHERE id=1
-    """, (
-        volume,
-    ))
-
+    """, (volume,))
     conn.commit()
-
     conn.close()
 
-
-    # Volume juga dianggap
-    # perubahan konfigurasi
     bump_version()
-
-
-    return redirect(
-        url_for("index")
-    )
+    flash(f"Volume diatur ke {volume}.", "success")
+    return redirect(url_for("index"))
 
 
 # =========================================================
 # TEST BEL
 # =========================================================
 
-@app.route(
-    "/test-bell",
-    methods=["POST"]
-)
+@app.route("/test-bell", methods=["POST"])
+@login_required
 def test_bell():
-
-    file_mp3 = int(
-        request.form["file_mp3"]
-    )
-
+    try:
+        file_mp3 = int(request.form["file_mp3"])
+    except (ValueError, KeyError):
+        flash("Nomor file MP3 tidak valid.", "error")
+        return redirect(url_for("index"))
 
     if file_mp3 < 1:
-
-        return redirect(
-            url_for("index")
-        )
-
-
-    now = now_local()
-
+        flash("Nomor file MP3 harus lebih dari 0.", "error")
+        return redirect(url_for("index"))
 
     conn = get_db()
-
     conn.execute("""
-        INSERT INTO test_bell
-        (
-            file_mp3,
-            created_at,
-            executed
-        )
+        INSERT INTO test_bell (file_mp3, created_at, executed)
         VALUES (?, ?, 0)
     """, (
         file_mp3,
-        now.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        now_local().strftime("%Y-%m-%d %H:%M:%S")
     ))
-
     conn.commit()
-
     conn.close()
 
-
-    return redirect(
-        url_for("index")
-    )
+    flash(f"Perintah tes bel MP3 #{file_mp3} dikirim ke antrean.", "success")
+    return redirect(url_for("index"))
 
 
 # =========================================================
 # API CONFIG ESP32
+# TIDAK DIPROTEKSI LOGIN karena dipanggil ESP32.
 # =========================================================
 
-@app.route(
-    "/api/esp32/config",
-    methods=["GET"]
-)
+@app.route("/api/esp32/config", methods=["GET"])
 def api_config():
-
     conn = get_db()
-
     row = conn.execute("""
         SELECT version, volume
         FROM config
         WHERE id=1
     """).fetchone()
-
     conn.close()
-
 
     return jsonify({
         "version": row["version"],
@@ -509,46 +504,23 @@ def api_config():
 # API JADWAL ESP32
 # =========================================================
 
-@app.route(
-    "/api/esp32/jadwal",
-    methods=["GET"]
-)
+@app.route("/api/esp32/jadwal", methods=["GET"])
 def api_jadwal():
-
     conn = get_db()
-
     rows = conn.execute("""
-        SELECT
-            id,
-            hari,
-            jam,
-            nama,
-            file_mp3,
-            durasi,
-            aktif
+        SELECT id, hari, jam, nama, file_mp3, durasi, aktif
         FROM jadwal
         ORDER BY hari, jam
     """).fetchall()
-
     conn.close()
-
 
     result = []
 
-
     for row in rows:
-
         try:
-
-            jam, menit = map(
-                int,
-                row["jam"].split(":")
-            )
-
-        except:
-
+            jam, menit = map(int, row["jam"].split(":"))
+        except (ValueError, AttributeError):
             continue
-
 
         result.append([
             row["id"],
@@ -561,30 +533,18 @@ def api_jadwal():
             row["aktif"]
         ])
 
-
-    return jsonify(
-        result
-    )
+    return jsonify(result)
 
 
 # =========================================================
-# API WAKTU
+# API WAKTU ESP32
 # =========================================================
 
-@app.route(
-    "/api/esp32/time",
-    methods=["GET"]
-)
+@app.route("/api/esp32/time", methods=["GET"])
 def api_time():
-
     try:
         now = now_local()
-
-        # timestamp absolut (UTC epoch)
         timestamp = int(now.timestamp())
-
-        # Epoch lokal WIB. MicroPython ESP32 akan menggunakannya
-        # bersama time.localtime() sebagai software clock lokal.
         timestamp_wib = timestamp + (7 * 3600)
 
         return jsonify({
@@ -610,29 +570,18 @@ def api_time():
 
 
 # =========================================================
-# API STATUS ESP32
+# API STATUS ESP32 - POST
+# TIDAK DIPROTEKSI LOGIN karena dipanggil ESP32.
 # =========================================================
 
-@app.route(
-    "/api/esp32/status",
-    methods=["POST"]
-)
+@app.route("/api/esp32/status", methods=["POST"])
 def receive_status():
-
     global esp32_status
 
-
-    data = request.get_json(
-        silent=True
-    )
-
+    data = request.get_json(silent=True)
 
     if not data:
-
-        return jsonify({
-            "status": "error"
-        }), 400
-
+        return jsonify({"status": "error"}), 400
 
     rtc_value = data.get("rtc_ok", False)
     if isinstance(rtc_value, str):
@@ -641,96 +590,31 @@ def receive_status():
         )
 
     esp32_status = {
-
-        "status": data.get(
-            "status",
-            ""
-        ),
-
-        "nama": data.get(
-            "nama",
-            ""
-        ),
-
-        "jam": data.get(
-            "jam",
-            ""
-        ),
-
-        "waktu_sekarang": data.get(
-            "waktu_sekarang",
-            ""
-        ),
-
-        "waktu_source": data.get(
-            "waktu_source",
-            "NONE"
-        ),
-
+        "status": data.get("status", ""),
+        "nama": data.get("nama", ""),
+        "jam": data.get("jam", ""),
+        "waktu_sekarang": data.get("waktu_sekarang", ""),
+        "waktu_source": data.get("waktu_source", "NONE"),
         "rtc_ok": bool(rtc_value),
-
-        "ip": data.get(
-            "ip",
-            ""
-        ),
-
-        "ram": data.get(
-            "ram",
-            0
-        ),
-
-        "version": data.get(
-            "version",
-            0
-        ),
-
-        "last_update":
-            now_local().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+        "ip": data.get("ip", ""),
+        "ram": data.get("ram", 0),
+        "version": data.get("version", 0),
+        "last_update": now_local().strftime("%Y-%m-%d %H:%M:%S")
     }
 
+    print("ESP32:", esp32_status)
 
-    print(
-        "ESP32:",
-        esp32_status
-    )
-
-
-    return jsonify({
-        "status": "ok"
-    })
+    return jsonify({"status": "ok"})
 
 
 # =========================================================
 # API STATUS ESP32 - GET
 # =========================================================
 
-@app.route(
-    "/api/esp32/status",
-    methods=["GET"]
-)
+@app.route("/api/esp32/status", methods=["GET"])
 def get_esp32_status():
-
     result = dict(esp32_status)
-
-    online = False
-
-    if esp32_status.get("last_update"):
-        try:
-            last = datetime.strptime(
-                esp32_status["last_update"],
-                "%Y-%m-%d %H:%M:%S"
-            ).replace(tzinfo=TIMEZONE)
-
-            online = (
-                now_local() - last
-            ).total_seconds() <= 30
-
-        except Exception:
-            online = False
-
-    result["online"] = online
+    result["online"] = is_esp32_online()
 
     return jsonify({
         "success": True,
@@ -740,110 +624,49 @@ def get_esp32_status():
 
 # =========================================================
 # API STATUS DASHBOARD
+# DIPROTEKSI LOGIN karena dipanggil browser dashboard.
 # =========================================================
 
-@app.route(
-    "/api/status",
-    methods=["GET"]
-)
+@app.route("/api/status", methods=["GET"])
+@login_required
 def api_status():
-
-    result = dict(
-        esp32_status
-    )
-
-
-    # Tentukan online berdasarkan
-    # update terakhir < 30 detik
-
-    online = False
-
-
-    if esp32_status[
-        "last_update"
-    ]:
-
-        try:
-
-            last = datetime.strptime(
-                esp32_status[
-                    "last_update"
-                ],
-                "%Y-%m-%d %H:%M:%S"
-            ).replace(
-                tzinfo=TIMEZONE
-            )
-
-
-            diff = (
-                now_local() - last
-            ).total_seconds()
-
-
-            online = diff <= 30
-
-        except:
-
-            online = False
-
-
-    result["online"] = online
-
-
-    return jsonify(
-        result
-    )
+    result = dict(esp32_status)
+    result["online"] = is_esp32_online()
+    return jsonify(result)
 
 
 # =========================================================
-# API TEST BEL
+# API TEST BEL ESP32
+# TIDAK DIPROTEKSI LOGIN karena dipanggil ESP32.
 # =========================================================
 
-@app.route(
-    "/api/esp32/test",
-    methods=["GET"]
-)
+@app.route("/api/esp32/test", methods=["GET"])
 def api_test():
-
     conn = get_db()
 
-
     row = conn.execute("""
-        SELECT
-            id,
-            file_mp3
+        SELECT id, file_mp3
         FROM test_bell
         WHERE executed=0
         ORDER BY id ASC
         LIMIT 1
     """).fetchone()
 
-
     if row is None:
-
         conn.close()
-
         return jsonify({
             "id": 0,
             "file_mp3": 0
         })
 
-
-    # Tandai langsung sebagai executed
-    # agar ESP32 tidak memainkan dua kali
-
     conn.execute("""
         UPDATE test_bell
         SET executed=1
         WHERE id=?
-    """, (
-        row["id"],
-    ))
+    """, (row["id"],))
 
     conn.commit()
-
     conn.close()
-
 
     return jsonify({
         "id": row["id"],
@@ -852,14 +675,26 @@ def api_test():
 
 
 # =========================================================
+# ERROR HANDLER
+# =========================================================
+
+@app.errorhandler(404)
+def page_not_found(error):
+    if request.path.startswith("/api/"):
+        return jsonify({
+            "success": False,
+            "error": "not_found"
+        }), 404
+    return render_template("404.html"), 404
+
+
+# =========================================================
 # START
 # =========================================================
 
+init_db()
+
 if __name__ == "__main__":
-
-    init_db()
-
-
     app.run(
         host="0.0.0.0",
         port=5007,
